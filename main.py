@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+from multiprocessing import Pool
 from typing import List
 
 import ffmpeg
@@ -131,6 +132,17 @@ def split_video(infile: str, output_dir: str, prefix: str, n_parts: int) -> List
     logging.info(segments)
     return segments
 
+def process_chunk(id, segment):
+    filename = os.path.join(workdir, basename + f"_cropped_{id}_" + pathlib.Path(args.infile).suffix)
+    logging.info(f"Processing chunk {id + 1}/{len(segments)}: {segment} -> {filename}")
+    if not trim_silence(segment,
+                    filename,
+                    args.min_silence_len,
+                    args.silence_thresh,
+                    args.margin):
+        filename = None
+    logging.info(f"Done processing chunk {id + 1}/{len(segments)}")
+    return filename
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Trim silence from video.')
@@ -144,6 +156,8 @@ if __name__ == '__main__':
                         help='margin (ms)', default=100)
     parser.add_argument('-n', dest='n_segments', type=int,
                         help='number of chunks to split input file to be processed independently', default=10)
+    parser.add_argument('-p', dest='pool_size', type=int,
+                        help='number of chunks to be processed concurrently', default=1)
     parser.add_argument('-d', dest='log_level', action='store_const', const=logging.DEBUG, help='print debugging info',
                         default=logging.WARNING)
     args = parser.parse_args()
@@ -153,14 +167,7 @@ if __name__ == '__main__':
     workdir = tempfile.mkdtemp()
     segments = split_video(args.infile, workdir, basename, args.n_segments)
     cropped_segments = []
-    for id, segment in enumerate(segments):
-        filename = os.path.join(workdir, basename + f"_cropped_{id}_" + pathlib.Path(args.infile).suffix)
-        logging.info(f"Processing chunk {id + 1}/{len(segments)}: {segment} -> {filename}")
-        if trim_silence(segment,
-                        filename,
-                        args.min_silence_len,
-                        args.silence_thresh,
-                        args.margin):
-            cropped_segments.append(filename)
-        logging.info(f"Done processing chunk {id + 1}/{len(segments)}")
+    with Pool(processes=args.pool_size) as pool:
+        cropped_segments = pool.starmap(process_chunk, enumerate(segments))
+        cropped_segments = [segment for segment in cropped_segments if segment is not None]
     concatenate_videos(cropped_segments, args.outfile)
