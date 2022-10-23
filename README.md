@@ -31,4 +31,11 @@ optional arguments:
 
 ## Example:
 
+### Docker
+```bash
+docker build -t trim-silence .
+docker run -v ~/relative/path/to/directory_with_videos:/opt/app/data --entrypoint python3 trim-silence main.py -i data/lect1.mkv -o data/lect1_trimmed.mkv -n 15 -p 3 -d
+```
+
+### Raw python
 ```python3 main.py -i lect1.mp4 -o lect1_trimmed.mp4 -d ```
