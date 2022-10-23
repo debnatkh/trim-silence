@@ -1,13 +1,14 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import argparse
+import functools
 import logging
 import os
 import pathlib
 import shutil
 import subprocess
-import tempfile
 from multiprocessing import Pool
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import List
 
 import ffmpeg
@@ -24,9 +25,8 @@ def time_format(ms):
     return "%02d:%02d:%02d.%03d" % (hours, minutes, sec, msec)
 
 
-basename = "lecture"
-chunks_count = 40
-ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+BASENAME = "lecture"
+FFMPEG_CMD = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
 
 def get_length(filename: str) -> float:
@@ -38,84 +38,9 @@ def get_length(filename: str) -> float:
     return float(result.stdout)
 
 
-def concatenate_videos(chunks: List[str], outfile: str):
-    list_file = tempfile.NamedTemporaryFile("w", suffix='.txt')
-    for file in chunks:
-        print(f"file '{file}'", file=list_file)
-    list_file.flush()
-    logging.info(f'{len(chunks)} chunks written to {list_file.name}')
-
-    logging.info(f'Concatenating chunks into {outfile}')
-
-    concat_args = ffmpeg_cmd + [
-        "-safe", "0",
-        "-f", "concat",
-        "-i", str(list_file.name),
-        "-c", "copy",
-        outfile
-    ]
-    subprocess.check_output(concat_args)
-
-
-def trim_silence(infile: str, outfile: str, min_silence_len: int, silence_thresh: int, margin: int) -> bool:
-    """
-    Returns
-    -------
-    True trimming was successful and resulted in nonempty outfile
-    """
-    workdir = tempfile.mkdtemp()
-    shutil.copy(os.path.join(workdir, infile), os.path.join(workdir, basename + pathlib.Path(infile).suffix))
-
-    infile_video = os.path.join(workdir, basename + pathlib.Path(infile).suffix)
-    infile_audio = os.path.join(workdir, basename + ".mp3")
-
-    logging.info(f"Extracting audio from \"{infile_video}\" to \"{infile_audio}\"")
-    ffmpeg \
-        .input(infile_video) \
-        .output(infile_audio) \
-        .run(quiet=True)
-    logging.info("Done extracting audio")
-
-    audio = AudioSegment.from_mp3(infile_audio)
-
-    logging.info("Detecting nonsilent parts")
-    parts = silence.detect_nonsilent(audio, min_silence_len=min_silence_len,
-                                     silence_thresh=audio.dBFS + silence_thresh)
-    parts = [(start - margin, stop + margin) for (start, stop) in parts]
-    logging.info(
-        f"Detected {len(parts)} nonsilent parts, total duration: {sum((stop - start) for start, stop in parts)} ms")
-    logging.info(parts)
-
-    if len(parts) == 0:
-        return False
-
-    logging.info("Trimming audio")
-    trimmed_audio = AudioSegment.empty()
-    for start, stop in parts:
-        trimmed_audio += audio[start:stop]
-    logging.info("Done trimming audio")
-
-    logging.info(f"Writing trimmed audio into {infile_audio} with duration {trimmed_audio.duration_seconds} s.")
-    trimmed_audio.export(infile_audio)
-
-    parts = [(start / 1000, stop / 1000) for (start, stop) in parts]
-
-    in_file = ffmpeg.input(infile_video)
-
-    joined = ffmpeg.concat(
-        ffmpeg.concat(
-            *[in_file.trim(start=start, end=stop).setpts('PTS-STARTPTS')
-              for start, stop in parts]),
-        ffmpeg.input(infile_audio),
-        v=1,
-        a=1).node
-    ffmpeg.output(joined[0], joined[1], outfile).run(quiet=True, overwrite_output=True)
-    return True
-
-
 def split_video(infile: str, output_dir: str, prefix: str, n_parts: int) -> List[str]:
     duration = round(get_length(infile) * 1000)
-    split_args = ffmpeg_cmd + ["-i", infile]
+    split_args = FFMPEG_CMD + ["-i", infile]
     segments = []
     for i in range(n_parts):
         filename = os.path.join(output_dir, f"{prefix}_{i}{pathlib.Path(infile).suffix}")
@@ -132,19 +57,96 @@ def split_video(infile: str, output_dir: str, prefix: str, n_parts: int) -> List
     logging.info(segments)
     return segments
 
-def process_chunk(id, segment):
-    filename = os.path.join(workdir, basename + f"_cropped_{id}_" + pathlib.Path(args.infile).suffix)
-    logging.info(f"Processing chunk {id + 1}/{len(segments)}: {segment} -> {filename}")
-    if not trim_silence(segment,
-                    filename,
-                    args.min_silence_len,
-                    args.silence_thresh,
-                    args.margin):
+
+def concatenate_videos(temp_dir, chunks: List[str], outfile: str):
+    with NamedTemporaryFile("w", suffix='.txt', dir=temp_dir) as list_file:
+        for file in chunks:
+            print(f"file '{file}'", file=list_file)
+        list_file.flush()
+        logging.info(f'{len(chunks)} chunks written to {list_file.name}')
+
+        logging.info(f'Concatenating chunks into {outfile}')
+
+        concat_args = FFMPEG_CMD + [
+            "-safe", "0",
+            "-f", "concat",
+            "-i", str(list_file.name),
+            "-c", "copy",
+            outfile
+        ]
+        subprocess.check_output(concat_args)
+
+
+def trim_silence(temp_dir: str, infile: str, outfile: str, min_silence_len: int, silence_thresh: int, margin: int) -> bool:
+    """
+    Returns
+    -------
+    True trimming was successful and resulted in nonempty outfile
+    """
+    with TemporaryDirectory(dir=temp_dir) as workdir:
+        shutil.copy(os.path.join(workdir, infile), os.path.join(workdir, BASENAME + pathlib.Path(infile).suffix))
+
+        infile_video = os.path.join(workdir, BASENAME + pathlib.Path(infile).suffix)
+        infile_audio = os.path.join(workdir, BASENAME + ".mp3")
+
+        logging.info(f"Extracting audio from \"{infile_video}\" to \"{infile_audio}\"")
+        ffmpeg \
+            .input(infile_video) \
+            .output(infile_audio) \
+            .run(quiet=True)
+        logging.info("Done extracting audio")
+
+        audio = AudioSegment.from_mp3(infile_audio)
+
+        logging.info("Detecting nonsilent parts")
+        parts = silence.detect_nonsilent(audio, min_silence_len=min_silence_len,
+                                         silence_thresh=audio.dBFS + silence_thresh)
+        parts = [(start - margin, stop + margin) for (start, stop) in parts]
+        logging.info(
+            f"Detected {len(parts)} nonsilent parts, total duration: {sum((stop - start) for start, stop in parts)} ms")
+        logging.info(parts)
+
+        if not parts:
+            return False
+
+        logging.info("Trimming audio")
+        segments = AudioSegment._sync(*[audio[start:stop] for start, stop in parts])
+        trimmed_audio = segments[0]._spawn([segment._data for segment in segments])
+        logging.info("Done trimming audio")
+
+        logging.info(f"Writing trimmed audio into {infile_audio} with duration {trimmed_audio.duration_seconds} s.")
+        trimmed_audio.export(infile_audio)
+
+        parts = [(start / 1000, stop / 1000) for (start, stop) in parts]
+
+        in_file = ffmpeg.input(infile_video)
+
+        joined = ffmpeg.concat(
+            ffmpeg.concat(
+                *[in_file.trim(start=start, end=stop).setpts('PTS-STARTPTS')
+                  for start, stop in parts]),
+            ffmpeg.input(infile_audio),
+            v=1,
+            a=1).node
+        ffmpeg.output(joined[0], joined[1], outfile).run(quiet=True, overwrite_output=True)
+        return True
+
+
+def process_chunk(workdir, args, total_segments, id, segment):
+    filename = os.path.join(workdir, BASENAME + f"_cropped_{id}_" + pathlib.Path(args.infile).suffix)
+    logging.info(f"Processing chunk {id + 1}/{total_segments}: {segment} -> {filename}")
+    if not trim_silence(args.temp_dir,
+                        segment,
+                        filename,
+                        args.min_silence_len,
+                        args.silence_thresh,
+                        args.margin):
         filename = None
-    logging.info(f"Done processing chunk {id + 1}/{len(segments)}")
+    logging.info(f"Done processing chunk {id + 1}/{total_segments}")
     return filename
 
-if __name__ == '__main__':
+
+def main():
     parser = argparse.ArgumentParser(description='Trim silence from video.')
     parser.add_argument('-i', '-input', dest='infile', help='input file', required=True)
     parser.add_argument('-o', '-output', dest='outfile', help='output file', default="cropped.mp4")
@@ -158,16 +160,22 @@ if __name__ == '__main__':
                         help='number of chunks to split input file to be processed independently', default=10)
     parser.add_argument('-p', dest='pool_size', type=int,
                         help='number of chunks to be processed concurrently', default=1)
+    parser.add_argument('-T', dest='temp_dir',
+                        help='directory for temporary files')
     parser.add_argument('-d', dest='log_level', action='store_const', const=logging.DEBUG, help='print debugging info',
                         default=logging.WARNING)
     args = parser.parse_args()
 
     logging.basicConfig(format="%(asctime)s - %(message)s", level=args.log_level)
 
-    workdir = tempfile.mkdtemp()
-    segments = split_video(args.infile, workdir, basename, args.n_segments)
-    cropped_segments = []
-    with Pool(processes=args.pool_size) as pool:
-        cropped_segments = pool.starmap(process_chunk, enumerate(segments))
+    with TemporaryDirectory(dir=args.temp_dir) as workdir:
+        segments = split_video(args.infile, workdir, BASENAME, args.n_segments)
+        cropped_segments = []
+        with Pool(processes=args.pool_size) as pool:
+            cropped_segments = pool.starmap(functools.partial(process_chunk, workdir, args, len(segments)), enumerate(segments))
         cropped_segments = [segment for segment in cropped_segments if segment is not None]
-    concatenate_videos(cropped_segments, args.outfile)
+        concatenate_videos(args.temp_dir, cropped_segments, args.outfile)
+
+
+if __name__ == '__main__':
+    main()
